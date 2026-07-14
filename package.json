@@ -1,0 +1,15 @@
+{
+  "name": "khienchandoi",
+  "version": "1.0.0",
+  "description": "Hệ thống máy chủ phòng thủ cho Render",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.1.5"
+  }
+}
+
