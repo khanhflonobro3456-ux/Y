@@ -1,14 +1,12 @@
+// package.json - Конфигурация зависимостей и скрипта запуска
 {
-  "name": "ultra-dos-render",
+  "name": "render-app",
   "version": "1.0.0",
-  "description": "Ultimate DoS attack web panel for Render",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=16.0.0"
-  },
-  "dependencies": {},
-  "license": "UNLICENSED"
+  "dependencies": {
+    "express": "^4.18.2"
+  }
 }
