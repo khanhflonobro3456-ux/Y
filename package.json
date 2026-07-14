@@ -1,14 +1,15 @@
 {
-  "name": "stress-tester",
-  "version": "1.0.0",
-  "description": "HTTP flood testing tool with web UI",
+  "name": "stress-tester-pro",
+  "version": "2.0.0",
+  "description": "High-performance HTTP flood testing tool",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "axios": "^1.6.0"
+    "http-proxy-agent": "^7.0.0",
+    "https-proxy-agent": "^7.0.0"
   },
   "engines": {
     "node": ">=18.x"
