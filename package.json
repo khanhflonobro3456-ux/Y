@@ -1,14 +1,14 @@
 {
-  "name": "dos-attack-node",
+  "name": "ultra-dos-render",
   "version": "1.0.0",
-  "description": "Web panel for DoS attack using Node.js",
+  "description": "Ultimate DoS attack web panel for Render",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {},
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=16.0.0"
   },
+  "dependencies": {},
   "license": "UNLICENSED"
 }
