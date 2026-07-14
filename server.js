@@ -2,51 +2,68 @@
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const cors = require('cors');
+const hpp = require('hpp');
+const xss = require('xss-clean');
+const mongoSanitize = require('express-mongo-sanitize');
 
 const app = express();
 
-// Kích hoạt Helmet thiết lập 11 lớp HTTP header bảo mật
-// Ngăn chặn các luồng tấn công XSS, Clickjacking và Sniffing
+// 1. Giới hạn kích thước payload cực nhỏ (1KB)
+// Chặn ngay lập tức các gói dữ liệu khổng lồ nhằm gây tràn bộ nhớ (Buffer Overflow/DDoS)
+app.use(express.json({ limit: '1kb' }));
+app.use(express.urlencoded({ extended: true, limit: '1kb' }));
+
+// 2. Kích hoạt Helmet với tất cả các lớp bảo mật HTTP Header
 app.use(helmet());
 
-// Thiết lập lá khiên Rate Limit (Cấu hình giới hạn tần suất nghiêm ngặt)
-// Thông số chặn lưu lượng: Chỉ cho phép 30 yêu cầu mỗi 15 phút từ một địa chỉ IP
-const defenseShield = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 30,
-  message: 'TỪ CHỐI KẾT NỐI: Tần suất yêu cầu vượt ngưỡng. Khiên chắn đã kích hoạt thao tác DROP.',
-  standardHeaders: true,
+// 3. Ngăn chặn NoSQL Injection
+app.use(mongoSanitize());
+
+// 4. Ngăn chặn XSS (Cross-Site Scripting) xóa mã độc trong nội dung gửi đến
+app.use(xss());
+
+// 5. Ngăn chặn HTTP Parameter Pollution (Gửi mảng tham số giả mạo)
+app.use(hpp());
+
+// 6. Cấu hình CORS nghiêm ngặt: Từ chối mọi request từ tên miền bên ngoài
+app.use(cors({ origin: false })); 
+
+// 7. Tường lửa Rate Limit cực đại (Khóa vĩnh viễn sau 100 request)
+const superShield = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000, // Theo dõi trong 24 giờ
+  max: 100, // Cắt đứt hoàn toàn khi chạm mốc 100 request
+  standardHeaders: false,
   legacyHeaders: false,
+  handler: (req, res) => {
+    // DROP kết nối ngay lập tức, không xử lý, không gửi thông báo
+    req.socket.destroy();
+  }
 });
 
-// Triển khai khiên chắn cho toàn bộ hệ thống định tuyến
-app.use(defenseShield);
+// Áp dụng lớp giáp cho toàn bộ hệ thống định tuyến
+app.use(superShield);
 
-// Giao diện kiểm tra phản hồi của máy chủ
+// 8. Tắt định danh máy chủ
+app.disable('x-powered-by');
+
+// Tuyến đường gốc
 app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="vi">
-    <head>
-      <meta charset="UTF-8">
-      <title>Hệ Thống Phòng Thủ</title>
-      <style>
-        body { background-color: #000; color: #0f0; font-family: monospace; text-align: center; margin-top: 15%; }
-        h1 { font-size: 3em; letter-spacing: 2px; text-transform: uppercase; }
-      </style>
-    </head>
-    <body>
-      <h1>Tường lửa bảo mật trực tuyến</h1>
-      <p>Trạng thái: Máy chủ Node.js đang hoạt động. Cấu hình bảo vệ: TỐI ĐA.</p>
-    </body>
-    </html>
-  `);
+  res.status(200).send('HỆ THỐNG HOẠT ĐỘNG. LỚP GIÁP CẤP ĐỘ CAO NHẤT ĐÃ KÍCH HOẠT.');
 });
 
-// Cấu hình cổng kết nối theo định tuyến của môi trường Render
+// Xử lý và Hủy (DROP) các route không tồn tại để tránh bị dò quét (Scanning)
+app.all('*', (req, res) => {
+  req.socket.destroy();
+});
+
 const PORT = process.env.PORT || 3000;
-
-// Khởi chạy hệ thống lắng nghe lưu lượng mạng
-app.listen(PORT, () => {
-  console.log(`[HỆ THỐNG] Máy chủ phòng thủ đang hoạt động tại cổng: ${PORT}`);
+const server = app.listen(PORT, () => {
+  console.log(`[HỆ THỐNG] Khởi động tại cổng ${PORT}.`);
 });
+
+// 9. Cấu hình Timeout Cực Đoan (Ngăn chặn Slowloris DDoS)
+// Ngắt kết nối nếu không nhận đủ dữ liệu trong 3 giây
+server.setTimeout(3000); 
+server.keepAliveTimeout = 3000;
+server.headersTimeout = 4000;
