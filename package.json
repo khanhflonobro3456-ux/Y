@@ -1,11 +1,16 @@
 {
-  "name": "render-app",
+  "name": "stress-tester",
   "version": "1.0.0",
+  "description": "HTTP flood testing tool with web UI",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18.x"
   }
 }
